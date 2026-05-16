@@ -208,3 +208,212 @@ class Database:
         except (sqlite3.Error, OSError) as error:
             self.last_backup_error = str(error)
             return None
+
+    def restore_db(self, backup_path):
+        backup_path = Path(backup_path)
+        if not backup_path.is_absolute():
+            backup_path = self.backup_dir / backup_path
+
+        if not backup_path.exists():
+            raise FileNotFoundError(f"Sauvegarde introuvable : {backup_path}")
+
+        source_connection = sqlite3.connect(backup_path)
+        target_connection = sqlite3.connect(self.db_path)
+        try:
+            source_connection.backup(target_connection)
+            target_connection.commit()
+        finally:
+            target_connection.close()
+            source_connection.close()
+
+        self._initialize_database()
+        return self.db_path
+
+    def _initialize_database(self):
+        with self._connect() as connection:
+            self._create_table(connection)
+            self._create_access_table(connection)
+            self._migrate_table_if_needed(connection)
+            self._normalize_existing_data(connection)
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_patients_date_bon ON patients(date_bon)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_patients_schedule ON patients(date_rdv, heure_rdv)"
+            )
+            connection.commit()
+
+    def _create_table(self, connection):
+        connection.execute(CREATE_PATIENTS_TABLE_SQL)
+
+    def _create_access_table(self, connection):
+        connection.execute(CREATE_ACCESS_TABLE_SQL)
+
+    def _get_existing_columns(self, connection):
+        rows = connection.execute("PRAGMA table_info(patients)").fetchall()
+        return [row["name"] for row in rows]
+
+    def _migrate_table_if_needed(self, connection):
+        existing_columns = self._get_existing_columns(connection)
+        if list(existing_columns) == list(PATIENT_COLUMNS):
+            return
+
+        self._rebuild_patients_table(connection, existing_columns)
+
+    def _rebuild_patients_table(self, connection, existing_columns):
+        connection.execute("ALTER TABLE patients RENAME TO patients_legacy")
+        connection.execute(CREATE_PATIENTS_TABLE_SQL)
+
+        legacy_columns = set(existing_columns)
+        select_parts = [
+            "id" if "id" in legacy_columns else "NULL AS id",
+            "nom" if "nom" in legacy_columns else "'' AS nom",
+            "prenom" if "prenom" in legacy_columns else "'' AS prenom",
+            "cin" if "cin" in legacy_columns else "'' AS cin",
+            "telephone" if "telephone" in legacy_columns else "'' AS telephone",
+            "type_examen" if "type_examen" in legacy_columns else "'' AS type_examen",
+            "date_bon" if "date_bon" in legacy_columns else "'' AS date_bon",
+            "date_rdv" if "date_rdv" in legacy_columns else "'' AS date_rdv",
+            "heure_rdv" if "heure_rdv" in legacy_columns else "'' AS heure_rdv",
+            "etat" if "etat" in legacy_columns else "'' AS etat",
+            (
+                "date_validation_reelle"
+                if "date_validation_reelle" in legacy_columns
+                else "'' AS date_validation_reelle"
+            ),
+            "ip" if "ip" in legacy_columns else "'' AS ip",
+        ]
+
+        connection.execute(
+            """
+            INSERT INTO patients (
+                id, nom, prenom, cin, telephone, type_examen, date_bon, date_rdv,
+                heure_rdv, etat, date_validation_reelle, ip
+            )
+            SELECT
+                {select_clause}
+            FROM patients_legacy
+            """.format(select_clause=", ".join(select_parts))
+        )
+        connection.execute("DROP TABLE patients_legacy")
+
+    def _normalize_existing_data(self, connection):
+        rows = connection.execute(
+            "SELECT id, type_examen, date_bon, heure_rdv, date_validation_reelle, ip FROM patients"
+        ).fetchall()
+
+        for row in rows:
+            canonical_exam = canonicalize_exam_type(row["type_examen"])
+            canonical_date_bon = canonicalize_date_only(row["date_bon"])
+            canonical_hour = canonicalize_hour(row["heure_rdv"])
+            canonical_validation_date = canonicalize_date(row["date_validation_reelle"])
+            canonical_ip_value = canonicalize_ip(row["ip"])
+            if (
+                canonical_exam != row["type_examen"]
+                or canonical_date_bon != row["date_bon"]
+                or canonical_hour != row["heure_rdv"]
+                or canonical_validation_date != row["date_validation_reelle"]
+                or canonical_ip_value != row["ip"]
+            ):
+                connection.execute(
+                    """
+                    UPDATE patients
+                    SET type_examen = ?, date_bon = ?, heure_rdv = ?, date_validation_reelle = ?, ip = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        canonical_exam,
+                        canonical_date_bon,
+                        canonical_hour,
+                        canonical_validation_date,
+                        canonical_ip_value,
+                        row["id"],
+                    ),
+                )
+
+    def _build_patient_filter_clause(
+        self,
+        search_term="",
+        search_field="Tous",
+        exam_filter="",
+        status_filter="",
+    ):
+        where_clauses = []
+        params = []
+        search_term = search_term.strip()
+        exam_filter = canonicalize_exam_type(exam_filter.strip())
+        status_filter = status_filter.strip()
+
+        if search_term:
+            like_value = f"%{search_term}%"
+            filters = {
+                "Nom": "nom LIKE ?",
+                "CIN": "cin LIKE ?",
+                "Telephone": "telephone LIKE ?",
+            }
+
+            if search_field in filters:
+                where_clauses.append(filters[search_field])
+                params.append(like_value)
+            else:
+                where_clauses.append(
+                    """
+                    (
+                        nom LIKE ?
+                        OR cin LIKE ?
+                        OR telephone LIKE ?
+                    )
+                    """
+                )
+                params.extend([like_value, like_value, like_value])
+
+        if exam_filter:
+            where_clauses.append("type_examen = ?")
+            params.append(exam_filter)
+
+        if status_filter:
+            where_clauses.append("etat = ?")
+            params.append(status_filter)
+
+        return where_clauses, params
+
+    def get_patients(
+        self,
+        search_term="",
+        search_field="Tous",
+        sort_order="ASC",
+        exam_filter="",
+        status_filter="",
+        limit=None,
+        offset=0,
+    ):
+        query = """
+        SELECT id, nom, prenom, cin, telephone, type_examen, date_bon, date_rdv,
+               heure_rdv, etat, date_validation_reelle, ip
+        FROM patients
+        """
+        where_clauses, params = self._build_patient_filter_clause(
+            search_term=search_term,
+            search_field=search_field,
+            exam_filter=exam_filter,
+            status_filter=status_filter,
+        )
+        sort_order = sort_order.upper()
+
+        if sort_order not in {"ASC", "DESC"}:
+            sort_order = "ASC"
+
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+
+        query += (
+            f" ORDER BY CASE WHEN date_bon = '' THEN 1 ELSE 0 END ASC, "
+            f"date_bon {sort_order}, date_rdv ASC, heure_rdv ASC, nom ASC, prenom ASC"
+        )
+
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([max(1, int(limit)), max(0, int(offset))])
+
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+
+        return [dict(row) for row in rows]
