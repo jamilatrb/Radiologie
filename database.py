@@ -417,3 +417,220 @@ class Database:
             rows = connection.execute(query, params).fetchall()
 
         return [dict(row) for row in rows]
+
+    def get_patient_stats(
+        self,
+        search_term="",
+        search_field="Tous",
+        exam_filter="",
+        status_filter="",
+    ):
+        query = """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN etat = 'Valide' THEN 1 ELSE 0 END) AS valid_count,
+            SUM(CASE WHEN etat = 'Non valide' THEN 1 ELSE 0 END) AS invalid_count
+        FROM patients
+        """
+        where_clauses, params = self._build_patient_filter_clause(
+            search_term=search_term,
+            search_field=search_field,
+            exam_filter=exam_filter,
+            status_filter=status_filter,
+        )
+
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+
+        with self._connect() as connection:
+            row = connection.execute(query, params).fetchone()
+
+        return {
+            "total": int(row["total"] or 0),
+            "valid_count": int(row["valid_count"] or 0),
+            "invalid_count": int(row["invalid_count"] or 0),
+        }
+
+    def get_patient(self, patient_id):
+        query = """
+        SELECT id, nom, prenom, cin, telephone, type_examen, date_bon, date_rdv,
+               heure_rdv, etat, date_validation_reelle, ip
+        FROM patients
+        WHERE id = ?
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(query, (patient_id,)).fetchone()
+
+        return dict(row) if row else None
+
+    def appointment_exists(self, date_rdv, heure_rdv, exclude_patient_id=None):
+        query = """
+        SELECT 1
+        FROM patients
+        WHERE date_rdv = ? AND heure_rdv = ?
+        """
+        params = [date_rdv, canonicalize_hour(heure_rdv)]
+
+        if exclude_patient_id is not None:
+            query += " AND id != ?"
+            params.append(exclude_patient_id)
+
+        query += " LIMIT 1"
+
+        with self._connect() as connection:
+            row = connection.execute(query, params).fetchone()
+
+        return row is not None
+
+    def get_next_available_slot(self, start_at=None, exclude_patient_id=None):
+        candidate = start_at or datetime.now()
+        candidate = candidate.replace(second=0, microsecond=0)
+
+        if start_at is None and (datetime.now().second > 0 or datetime.now().microsecond > 0):
+            candidate += timedelta(minutes=1)
+
+        while self.appointment_exists(
+            candidate.strftime("%Y-%m-%d"),
+            candidate.strftime("%H:%M"),
+            exclude_patient_id=exclude_patient_id,
+        ):
+            candidate += timedelta(minutes=1)
+
+        return candidate.strftime("%Y-%m-%d"), candidate.strftime("%H:%M")
+
+    def has_access_credentials(self):
+        with self._connect() as connection:
+            row = connection.execute("SELECT 1 FROM app_access WHERE id = 1").fetchone()
+        return row is not None
+
+    def get_access_username(self):
+        with self._connect() as connection:
+            row = connection.execute("SELECT username FROM app_access WHERE id = 1").fetchone()
+        return row["username"] if row else ""
+
+    def create_access_credentials(self, username, password):
+        username = (username or "").strip()
+        password = password or ""
+
+        if not username:
+            raise ValueError("Le nom d'utilisateur est obligatoire.")
+        if len(password) < PASSWORD_MIN_LENGTH:
+            raise ValueError(
+                f"Le mot de passe doit contenir au moins {PASSWORD_MIN_LENGTH} caractères."
+            )
+
+        salt = secrets.token_hex(16)
+        password_hash = hash_password(password, salt)
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO app_access (
+                    id, username, password_hash, password_salt, updated_at
+                ) VALUES (1, ?, ?, ?, ?)
+                """,
+                (username, password_hash, salt, updated_at),
+            )
+            connection.commit()
+
+    def verify_access_credentials(self, username, password):
+        username = (username or "").strip()
+        password = password or ""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT username, password_hash, password_salt
+                FROM app_access
+                WHERE id = 1
+                """
+            ).fetchone()
+
+        if row is None or row["username"] != username:
+            return False
+
+        computed_hash = hash_password(password, row["password_salt"])
+        return hmac.compare_digest(computed_hash, row["password_hash"])
+
+    def add_patient(self, patient):
+        query = """
+        INSERT INTO patients (
+            nom, prenom, cin, telephone, type_examen, date_bon, date_rdv, heure_rdv,
+            etat, date_validation_reelle, ip
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        values = (
+            patient["nom"],
+            patient["prenom"],
+            patient["cin"],
+            patient["telephone"],
+            canonicalize_exam_type(patient["type_examen"]),
+            canonicalize_date_only(patient.get("date_bon", "")),
+            patient["date_rdv"],
+            canonicalize_hour(patient["heure_rdv"]),
+            patient["etat"],
+            canonicalize_date(patient.get("date_validation_reelle", "")),
+            canonicalize_ip(patient.get("ip", "")),
+        )
+
+        with self._connect() as connection:
+            connection.execute(query, values)
+            connection.commit()
+        self.auto_backup()
+
+    def update_patient(self, patient_id, patient):
+        query = """
+        UPDATE patients
+        SET nom = ?,
+            prenom = ?,
+            cin = ?,
+            telephone = ?,
+            type_examen = ?,
+            date_bon = ?,
+            date_rdv = ?,
+            heure_rdv = ?,
+            etat = ?,
+            date_validation_reelle = ?,
+            ip = ?
+        WHERE id = ?
+        """
+        values = (
+            patient["nom"],
+            patient["prenom"],
+            patient["cin"],
+            patient["telephone"],
+            canonicalize_exam_type(patient["type_examen"]),
+            canonicalize_date_only(patient.get("date_bon", "")),
+            patient["date_rdv"],
+            canonicalize_hour(patient["heure_rdv"]),
+            patient["etat"],
+            canonicalize_date(patient.get("date_validation_reelle", "")),
+            canonicalize_ip(patient.get("ip", "")),
+            patient_id,
+        )
+
+        with self._connect() as connection:
+            connection.execute(query, values)
+            connection.commit()
+        self.auto_backup()
+
+    def delete_patient(self, patient_id):
+        with self._connect() as connection:
+            connection.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
+            connection.commit()
+        self.auto_backup()
+
+    def delete_patients(self, patient_ids):
+        patient_ids = [int(patient_id) for patient_id in patient_ids]
+        if not patient_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in patient_ids)
+        query = f"DELETE FROM patients WHERE id IN ({placeholders})"
+
+        with self._connect() as connection:
+            connection.execute(query, patient_ids)
+            connection.commit()
+        self.auto_backup()
